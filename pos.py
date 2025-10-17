@@ -411,9 +411,17 @@ class DataManager:
             return conn.execute("SELECT * FROM categories ORDER BY name ASC").fetchall()
 
     @staticmethod
-    def get_customers():
+    def get_customers(search_query=None):
+        query = "SELECT * FROM customers"
+        params = []
+        if search_query:
+            query += " WHERE name LIKE ? OR phone LIKE ? OR email LIKE ?"
+            search_param = f"%{search_query}%"
+            params.extend([search_param, search_param, search_param])
+        query += " ORDER BY name ASC"
+
         with DatabaseManager.get_conn() as conn:
-            return conn.execute("SELECT * FROM customers ORDER BY name ASC").fetchall()
+            return conn.execute(query, params).fetchall()
 
     @staticmethod
     def add_customer(name, phone, email, address):
@@ -435,12 +443,16 @@ class DataManager:
 
     @staticmethod
     def get_sales(start_date=None, end_date=None, limit=None):
-        query = "SELECT * FROM sales"
+        query = """
+            SELECT s.*, c.name as customer_name
+            FROM sales s
+            LEFT JOIN customers c ON s.customer_id = c.id
+        """
         params = []
         if start_date and end_date:
-            query += " WHERE DATE(created_at) BETWEEN ? AND ?"
+            query += " WHERE DATE(s.created_at) BETWEEN ? AND ?"
             params.extend([start_date, end_date])
-        query += " ORDER BY created_at DESC"
+        query += " ORDER BY s.created_at DESC"
         if limit:
             query += f" LIMIT {limit}"
         
@@ -680,20 +692,9 @@ class CustomerSelectionDialog(Toplevel):
             ))
 
     def search_customers(self):
-        query = self.search_var.get().strip().lower()
-        
-        # Clear existing items
-        for item in self.customer_tree.get_children():
-            self.customer_tree.delete(item)
-        
-        # Add matching customers to treeview
-        for customer in self.customers:
-            if (query in customer['name'].lower() or 
-                (customer['phone'] and query in customer['phone']) or 
-                (customer['email'] and query in customer['email'])):
-                self.customer_tree.insert('', 'end', iid=str(customer['id']), values=(
-                    customer['id'], customer['name'], customer['phone'] or 'N/A', customer['email'] or 'N/A'
-                ))
+        query = self.search_var.get().strip()
+        self.customers = DataManager.get_customers(search_query=query)
+        self.populate_customer_tree()
 
     def add_new_customer(self):
         dialog = CustomerFormDialog(self)
@@ -2123,26 +2124,23 @@ class CustomerManagerDialog(Toplevel):
                                    ))
 
     def search_customers(self):
-        query = self.search_var.get().strip().lower()
+        query = self.search_var.get().strip()
         
         # Clear existing items
         for item in self.customer_tree.get_children():
             self.customer_tree.delete(item)
         
         # Get customers with search
-        customers = DataManager.get_customers()
+        customers = DataManager.get_customers(search_query=query)
         
         for customer in customers:
-            if (query in customer['name'].lower() or 
-                (customer['phone'] and query in customer['phone']) or 
-                (customer['email'] and query in customer['email'])):
-                self.customer_tree.insert('', 'end', iid=str(customer['id']),
-                                       values=(
-                                           customer['id'],
-                                           customer['name'],
-                                           customer['phone'] or 'N/A',
-                                           customer['email'] or 'N/A'
-                                       ))
+            self.customer_tree.insert('', 'end', iid=str(customer['id']),
+                                   values=(
+                                       customer['id'],
+                                       customer['name'],
+                                       customer['phone'] or 'N/A',
+                                       customer['email'] or 'N/A'
+                                   ))
 
     def clear_search(self):
         self.search_var.set("")
@@ -2408,13 +2406,7 @@ class SalesReportDialog(Toplevel):
                 date_str = dt.strftime('%Y-%m-%d %H:%M')
                 
                 # Get customer name if available
-                customer_name = "Walk-in"
-                if sale['customer_id']:
-                    customers = DataManager.get_customers()
-                    for customer in customers:
-                        if customer['id'] == sale['customer_id']:
-                            customer_name = customer['name']
-                            break
+                customer_name = sale['customer_name'] or "Walk-in"
                 
                 self.sales_tree.insert('', 'end', iid=str(sale['id']),
                                     values=(
@@ -2660,13 +2652,7 @@ class SalesReportDialog(Toplevel):
                     date_str = dt.strftime('%Y-%m-%d %H:%M')
                     
                     # Get customer name if available
-                    customer_name = "Walk-in"
-                    if sale['customer_id']:
-                        customers = DataManager.get_customers()
-                        for customer in customers:
-                            if customer['id'] == sale['customer_id']:
-                                customer_name = customer['name']
-                                break
+                    customer_name = sale['customer_name'] or "Walk-in"
                     
                     writer.writerow({
                         'Date': date_str,
@@ -2714,13 +2700,7 @@ class SalesReportDialog(Toplevel):
                 date_str = dt.strftime('%Y-%m-%d %H:%M')
                 
                 # Get customer name if available
-                customer_name = "Walk-in"
-                if sale['customer_id']:
-                    customers = DataManager.get_customers()
-                    for customer in customers:
-                        if customer['id'] == sale['customer_id']:
-                            customer_name = customer['name']
-                            break
+                customer_name = sale['customer_name'] or "Walk-in"
                 
                 data.append({
                     'Date': date_str,
@@ -3651,6 +3631,7 @@ class ModernPOSApp(Tk):
         self.barcode_buffer = ""
         self.last_barcode_time = time.time()
         self.selected_category_id = None
+        self.product_card_cache = {}
 
         # Initialize totals variables BEFORE creating widgets
         self.subtotal_var = StringVar(value="PKR0.00")
@@ -4035,9 +4016,9 @@ class ModernPOSApp(Tk):
                     widget.configure(bg=self.colors['secondary'])
 
     def refresh_products(self, search_query=None):
-        # Clear the scrollable frame
-        for widget in self.scrollable_products.winfo_children():
-            widget.destroy()
+        # Hide all cards first
+        for card in self.product_card_cache.values():
+            card.grid_remove()
 
         # Get products filtered by selected category
         products = DataManager.get_products(category_id=self.selected_category_id, search_query=search_query)
@@ -4048,62 +4029,26 @@ class ModernPOSApp(Tk):
             row = i // columns
             col = i % columns
 
-            # Create product card with modern styling
-            product_card = Frame(self.scrollable_products, relief=RIDGE, bd=2, bg='white', padx=12, pady=12)
+            product_id = product['id']
+            if product_id in self.product_card_cache:
+                # Update existing card
+                product_card = self.product_card_cache[product_id]
+                # Update labels and button states inside the card
+                # This part is simplified; in a real app, you'd have references to labels
+                for widget in product_card.winfo_children():
+                    widget.destroy() # Simple way to refresh card content
+
+                # Re-create content
+                self.create_product_card_content(product_card, product, currency)
+            else:
+                # Create new card
+                product_card = Frame(self.scrollable_products, relief=RIDGE, bd=2, bg='white', padx=12, pady=12)
+                self.create_product_card_content(product_card, product, currency)
+                self.product_card_cache[product_id] = product_card
+
             product_card.grid(row=row, column=col, sticky='nsew', padx=8, pady=8)
             self.scrollable_products.columnconfigure(col, weight=1)
             self.scrollable_products.rowconfigure(row, weight=1)
-
-            # Product name with modern styling
-            name_frame = Frame(product_card, bg='white')
-            name_frame.pack(fill=X, pady=(0, 8))
-            
-            name_label = Label(name_frame, text=product['name'], font=('Arial', 12, 'bold'), 
-                              bg='white', fg=self.colors['dark'], wraplength=180)
-            name_label.pack(anchor='w')
-
-            # Product price with modern styling
-            price_frame = Frame(product_card, bg='white')
-            price_frame.pack(fill=X, pady=(0, 8))
-            
-            price_label = Label(price_frame, text=f"{currency}{product['price']:.2f}", 
-                               font=('Arial', 11, 'bold'), bg='white', fg=self.colors['primary'])
-            price_label.pack(anchor='w')
-
-            # Stock info with modern styling
-            stock_frame = Frame(product_card, bg='white')
-            stock_frame.pack(fill=X, pady=(0, 8))
-            
-            stock_text = f"Stock: {product['stock']}"
-            if product['stock'] <= product['min_stock']:
-                stock_text += " ⚠️"
-                stock_color = self.colors['warning']
-            else:
-                stock_color = self.colors['success']
-            stock_label = Label(stock_frame, text=stock_text, font=('Arial', 10, 'bold'), 
-                               bg='white', fg=stock_color)
-            stock_label.pack(anchor='w')
-
-            # Add to cart button with modern styling
-            button_frame = Frame(product_card, bg='white')
-            button_frame.pack(fill=BOTH, expand=True, pady=(8, 0))
-            
-            if product['stock'] > 0:
-                # Create a closure to capture the current product
-                def make_add_command(p):
-                    return lambda: self.add_to_cart(p)
-                
-                add_btn = Button(button_frame, text="Add to Cart", font=('Arial', 10, 'bold'),
-                                 bg=self.colors['success'], fg='white', pady=8,
-                                 command=make_add_command(product))
-                add_btn.pack(fill=BOTH, expand=True)
-                # Add hover effects
-                add_btn.bind("<Enter>", lambda e, b=add_btn: b.configure(bg=self.colors['secondary']))
-                add_btn.bind("<Leave>", lambda e, b=add_btn: b.configure(bg=self.colors['success']))
-            else:
-                out_btn = Label(button_frame, text="Out of Stock", font=('Arial', 10, 'bold'),
-                                bg=self.colors['danger'], fg='white', pady=8)
-                out_btn.pack(fill=BOTH, expand=True)
 
         # Configure grid weights for responsive layout
         for i in range(columns):
@@ -4111,6 +4056,58 @@ class ModernPOSApp(Tk):
 
         # Update quick pay buttons based on cart
         self.update_quick_pay_buttons()
+
+    def create_product_card_content(self, product_card, product, currency):
+        # Product name with modern styling
+        name_frame = Frame(product_card, bg='white')
+        name_frame.pack(fill=X, pady=(0, 8))
+
+        name_label = Label(name_frame, text=product['name'], font=('Arial', 12, 'bold'),
+                          bg='white', fg=self.colors['dark'], wraplength=180)
+        name_label.pack(anchor='w')
+
+        # Product price with modern styling
+        price_frame = Frame(product_card, bg='white')
+        price_frame.pack(fill=X, pady=(0, 8))
+
+        price_label = Label(price_frame, text=f"{currency}{product['price']:.2f}",
+                           font=('Arial', 11, 'bold'), bg='white', fg=self.colors['primary'])
+        price_label.pack(anchor='w')
+
+        # Stock info with modern styling
+        stock_frame = Frame(product_card, bg='white')
+        stock_frame.pack(fill=X, pady=(0, 8))
+
+        stock_text = f"Stock: {product['stock']}"
+        if product['stock'] <= product['min_stock']:
+            stock_text += " ⚠️"
+            stock_color = self.colors['warning']
+        else:
+            stock_color = self.colors['success']
+        stock_label = Label(stock_frame, text=stock_text, font=('Arial', 10, 'bold'),
+                           bg='white', fg=stock_color)
+        stock_label.pack(anchor='w')
+
+        # Add to cart button with modern styling
+        button_frame = Frame(product_card, bg='white')
+        button_frame.pack(fill=BOTH, expand=True, pady=(8, 0))
+
+        if product['stock'] > 0:
+            # Create a closure to capture the current product
+            def make_add_command(p):
+                return lambda: self.add_to_cart(p)
+
+            add_btn = Button(button_frame, text="Add to Cart", font=('Arial', 10, 'bold'),
+                             bg=self.colors['success'], fg='white', pady=8,
+                             command=make_add_command(product))
+            add_btn.pack(fill=BOTH, expand=True)
+            # Add hover effects
+            add_btn.bind("<Enter>", lambda e, b=add_btn: b.configure(bg=self.colors['secondary']))
+            add_btn.bind("<Leave>", lambda e, b=add_btn: b.configure(bg=self.colors['success']))
+        else:
+            out_btn = Label(button_frame, text="Out of Stock", font=('Arial', 10, 'bold'),
+                            bg=self.colors['danger'], fg='white', pady=8)
+            out_btn.pack(fill=BOTH, expand=True)
 
     def refresh_cart(self):
         for item in self.cart_tree.get_children():
@@ -4309,23 +4306,24 @@ class ModernPOSApp(Tk):
         if not self.cart:
             return
 
-        total = float(self.total_var.get().replace(self.settings.get('currency_symbol', 'PKR'), ''))
+        currency = self.settings.get('currency_symbol', 'PKR')
+        total = float(self.total_var.get().replace(currency, ''))
+        subtotal = float(self.subtotal_var.get().replace(currency, ''))
+        discount = float(self.discount_amount_var.get().replace(f"-{currency}", ''))
+        tax = float(self.tax_var.get().replace(currency, ''))
+
         payment_dialog = EnhancedPaymentDialog(self, total)
         self.wait_window(payment_dialog)
 
         if payment_dialog.result:
-            self.complete_sale(total, payment_dialog.result[0], payment_dialog.result[1])
+            paid_amount, payment_method = payment_dialog.result
+            self.complete_sale(total, paid_amount, payment_method, subtotal, discount, tax)
 
-    def complete_sale(self, total, paid_amount, payment_method):
+    def complete_sale(self, total, paid_amount, payment_method, subtotal, discount_amount, tax_amount):
         """Complete the sale transaction"""
         cashier = self.settings.get('cashier_name', 'Unknown')
 
         try:
-            subtotal = sum(item['price'] * item['qty'] for item in self.cart)
-            discount_amount = self.parse_discount(self.discount_var.get(), subtotal)
-            tax_amount = (subtotal - discount_amount) * (self.tax_percent / 100)
-            total = subtotal - discount_amount + tax_amount
-
             # Save sale
             customer_id = getattr(self.selected_customer, 'id', None) if self.selected_customer else None
             sale_id, receipt_number = DataManager.save_sale(
